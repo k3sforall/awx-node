@@ -1,0 +1,40 @@
+---
+- name: Sync K8s nodes and labels into AWX inventory
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    controller_host: "{{ lookup('env','CONTROLLER_HOST') | default(omit) }}"
+    controller_oauthtoken: "{{ lookup('env','CONTROLLER_OAUTH_TOKEN') | default(omit) }}"
+    organization: "Default"
+    inventory_name: "k3s-nodes"
+
+  tasks:
+    - name: Collect Kubernetes Nodes
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: k8s_nodes
+
+    - name: Ensure target inventory exists
+      awx.awx.inventory:
+        name: "{{ inventory_name }}"
+        organization: "{{ organization }}"
+        state: present
+
+    - name: Build simplified host objects
+      vars:
+        jq: "[].{name: metadata.name, labels: metadata.labels, ip: (status.addresses | items | selectattr('type','equalto','InternalIP') | map(attribute='address') | first)}"
+      set_fact:
+        nodes_flat: "{{ k8s_nodes.resources | default([]) | json_query(jq) }}"
+
+    - name: Upsert hosts with k8s labels as variables
+      awx.awx.host:
+        name: "{{ item.name }}"
+        inventory: "{{ inventory_name }}"
+        state: present
+        variables:
+          ansible_host: "{{ item.ip }}"
+          k8s_name: "{{ item.name }}"
+          k8s_labels: "{{ item.labels | default({}) }}"
+      loop: "{{ nodes_flat }}"
