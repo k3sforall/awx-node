@@ -1,57 +1,62 @@
 ---
-- name: Sync K8s nodes and labels into AWX inventory
+- name: Ensure AWX inventory via API (with preflight checks)
   hosts: localhost
   gather_facts: false
 
   vars:
-    k8s_host: "https://kubernetes.default.svc"
-    k8s_token: ""
-    k8s_validate_certs: false
-    controller_host: "http://awx.dokjongban.com"
-    controller_oauthtoken: ""
-    organization: "Default"
+    # --- 여기를 Job Template Extra Vars에서 채우세요 ---
+    controller_host: "http://awx-service.awx.svc.cluster.local"  # 내부 서비스 DNS 권장
+    controller_oauthtoken: ""          # Users -> 본인 -> Tokens -> Add 로 발급한 토큰
+    organization_name: "Default"       # 실제 조직명 (다르면 바꾸세요)
     inventory_name: "k3s-nodes"
 
   tasks:
-    - name: Collect Kubernetes Nodes via API (no kubeconfig needed)
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Node
-        host: "{{ k8s_host }}"
-        api_key: "{{ k8s_token }}"          # ❗ 토큰만 (Bearer 접두어 금지)
-        validate_certs: "{{ k8s_validate_certs }}"
-      register: k8s_nodes
+    - name: Preflight | AWX /api/v2/ping
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/ping/"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: awx_ping
 
-    - name: Ensure target inventory exists
+    - name: Debug | ping result (optional)
+      ansible.builtin.debug:
+        var: awx_ping.json
+
+    - name: Lookup | Organization by name
+      ansible.builtin.uri:
+        url: >-
+          {{ controller_host | regex_replace('/$','') }}/api/v2/organizations/
+          ?name={{ organization_name | urlencode }}
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: org_q
+
+    - name: Fail if organization not found
+      ansible.builtin.fail:
+        msg: "Organization '{{ organization_name }}' not found (results=0)."
+      when: (org_q.json.results | length) == 0
+
+    - name: Set fact | organization_id
+      ansible.builtin.set_fact:
+        organization_id: "{{ org_q.json.results[0].id | int }}"
+
+    - name: Ensure target inventory exists (by org_id)
       awx.awx.inventory:
         name: "{{ inventory_name }}"
-        organization: "{{ organization }}"
+        organization: "{{ organization_id }}"     # <-- 숫자 ID 사용
         state: present
+        # 두 계열 파라미터 모두 전달(버전 호환)
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
+        tower_host: "{{ controller_host }}"
+        tower_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: false
-
-    - name: Build simplified host objects
-      vars:
-        jq: >-
-          [].{name: metadata.name,
-              labels: metadata.labels,
-              ip: (status.addresses | items
-                   | selectattr('type','equalto','InternalIP')
-                   | map(attribute='address') | first)}
-      set_fact:
-        nodes_flat: "{{ k8s_nodes.resources | default([]) | json_query(jq) }}"
-
-    - name: Upsert hosts with k8s labels as variables
-      awx.awx.host:
-        name: "{{ item.name }}"
-        inventory: "{{ inventory_name }}"
-        state: present
-        variables:
-          ansible_host: "{{ item.ip }}"
-          k8s_name: "{{ item.name }}"
-          k8s_labels: "{{ item.labels | default({}) }}"
-        controller_host: "{{ controller_host }}"
-        controller_oauthtoken: "{{ controller_oauthtoken }}"
-        validate_certs: false
-      loop: "{{ nodes_flat }}"
+        tower_verify_ssl: false
