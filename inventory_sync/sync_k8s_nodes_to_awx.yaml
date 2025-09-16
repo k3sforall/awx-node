@@ -1,30 +1,24 @@
 ---
-- name: "E2E | K8s 라벨 → AWX 인벤토리 반영 (상세 로그 + 사후 검증)"
+- name: "E2E | K8s 라벨 → AWX 인벤토리 반영 (상세 로그 + 직접 PATCH + 사후 검증)"
   hosts: localhost
   connection: local
   gather_facts: false
   any_errors_fatal: true
 
   vars:
-    # === Job Template의 Extra Vars에서 채우십시오 ===
-    # AWX(컨트롤러) 접근
     controller_host: "http://awx-service.awx.svc.cluster.local"
     controller_oauthtoken: ""
     organization_name: "Default"
     inventory_name: "k3s-nodes"
 
-    # K8s API 접근
     k8s_host: "https://kubernetes.default.svc"
-    k8s_token: ""              # SA 토큰(유효/올바른 audience)
-    k8s_validate_certs: false  # 내부 CA 없으면 false
+    k8s_token: ""
+    k8s_validate_certs: false
 
-    # 동기화 시 호스트에 주입할 기본 접속계정
     awx_node_user: "ubuntu"
 
   tasks:
-    #####################################################################
-    # 0) 프리플라이트: 컨트롤러 API 확인
-    #####################################################################
+    # 0) AWX ping
     - name: "[0] Preflight | GET /api/v2/ping"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/ping/"
@@ -42,17 +36,10 @@
           - "AWX version={{ awx_ping.json.version | default('unknown') }}"
           - "active_node={{ awx_ping.json.active_node | default('n/a') }}"
 
-    #####################################################################
-    # 1) 조직/인벤토리 보장 + ID 확보
-    #####################################################################
-    - name: "[1] 조직 조회 URL 생성"
-      ansible.builtin.set_fact:
-        org_lookup_url: >-
-          {{ controller_host | regex_replace('/$','') }}/api/v2/organizations/?name={{ organization_name | urlencode }}
-
-    - name: "[1] 조직 조회"
+    # 1) 조직/인벤토리 보장
+    - name: "[1] 조직 조회 (name={{ organization_name }})"
       ansible.builtin.uri:
-        url: "{{ org_lookup_url }}"
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/organizations/?name={{ organization_name | urlencode }}"
         method: GET
         headers:
           Authorization: "Bearer {{ controller_oauthtoken }}"
@@ -70,7 +57,7 @@
       ansible.builtin.set_fact:
         organization_id: "{{ org_q.json.results[0].id | int }}"
 
-    - name: "[1] 인벤토리 존재 보장 (POST if needed)"
+    - name: "[1] 인벤토리 보장 (POST-if-needed)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/inventories/"
         method: POST
@@ -90,10 +77,7 @@
 
     - name: "[1] 인벤토리 ID 확보 (GET)"
       ansible.builtin.uri:
-        url: >-
-          {{ controller_host | regex_replace('/$','') }}/api/v2/inventories/
-          ?name={{ inventory_name | urlencode }}
-          &organization={{ organization_id }}
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/inventories/?name={{ inventory_name | urlencode }}&organization={{ organization_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ controller_oauthtoken }}"
@@ -116,9 +100,7 @@
           - "organization_id={{ organization_id }}"
           - "inventory_id={{ inventory_id }} ({{ inventory_name }})"
 
-    #####################################################################
     # 2) K8s 노드 수집
-    #####################################################################
     - name: "[2] K8s Nodes 수집(k8s_info)"
       kubernetes.core.k8s_info:
         api_version: v1
@@ -157,109 +139,36 @@
         that: "(nodes_flat | length) > 0"
         fail_msg: "K8s에서 노드를 하나도 찾지 못했습니다."
 
-    #####################################################################
-    # 3) 호스트 업서트(awx.awx.host) + 변경 로그
-    #####################################################################
-    - name: "[3] Upsert host → AWX (awx.awx.host, dict vars)"
-      awx.awx.host:
-        name: "{{ item.name }}"
-        inventory: "{{ inventory_name }}"
-        state: present
-        enabled: true
-        variables:
-          ansible_host: "{{ item.ip }}"
-          ansible_user: "{{ awx_node_user }}"
-          k8s_name: "{{ item.name }}"
-          k8s_labels: "{{ item.labels | default({}) }}"
-        controller_host: "{{ controller_host }}"
-        controller_oauthtoken: "{{ controller_oauthtoken }}"
-        validate_certs: false
+    # 3) 각 노드 → 호스트 생성/갱신 (직접 API)
+    - name: "[3] 호스트 처리 루프: 조회→없으면 생성→비교→PATCH"
+      ansible.builtin.include_tasks: "tasks_host_upsert.yml"
       loop: "{{ nodes_flat }}"
       loop_control:
-        label: "{{ item.name }} ({{ item.ip }})"
-      register: upserts
+        loop_var: nodeitem
+        label: "{{ nodeitem.name }} ({{ nodeitem.ip }})"
+      vars:
+        _controller_host: "{{ controller_host | regex_replace('/$','') }}"
+        _token: "{{ controller_oauthtoken }}"
+        _inventory_id: "{{ inventory_id }}"
+        _awx_user: "{{ awx_node_user }}"
 
-    - name: "[3] 업서트 결과 요약(변경/비변경)"
-      ansible.builtin.debug:
-        msg: >-
-          {{
-            upserts.results | map('extract', {'item': 'name'}) | list |
-            zip( upserts.results | map(attribute='changed') | list ) |
-            list | map('regex_replace', '^(.*), (True|False)$', 'host=\\1 changed=\\2') | list
-          }}
-
-    #####################################################################
-    # 4) 사후 검증: AWX API로 실제 저장된 variables를 다시 읽어 확인
-    #####################################################################
-    - name: "[4] 각 호스트 조회 URL 생성"
-      ansible.builtin.set_fact:
-        _host_query_urls: >-
-          {{
-            (_host_query_urls | default([])) + [
-              (controller_host | regex_replace('/$','') )
-              ~ '/api/v2/hosts/?name=' ~ (item.name | urlencode)
-              ~ '&inventory=' ~ (inventory_id | string)
-            ]
-          }}
-      loop: "{{ nodes_flat }}"
-
-    - name: "[4] 호스트 조회 (name+inventory)"
+    # 4) 사후 검증 리포트
+    - name: "[4] 사후 검증 | hosts/?name=*&inventory=id"
       ansible.builtin.uri:
-        url: "{{ item }}"
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?inventory={{ inventory_id }}"
         method: GET
         headers:
           Authorization: "Bearer {{ controller_oauthtoken }}"
         return_content: true
         status_code: 200
         validate_certs: false
-      loop: "{{ _host_query_urls }}"
-      register: host_queries
+      register: final_hosts
 
-    - name: "[4] host_id 목록 만들기"
-      ansible.builtin.set_fact:
-        host_ids: >-
-          {{
-            host_queries.results
-            | map(attribute='json')
-            | map(attribute='results')
-            | map('first')
-            | map(attribute='id')
-            | list
-          }}
-
-    - name: "[4] host_id 확인"
-      ansible.builtin.debug:
-        var: host_ids
-
-    - name: "[4] 상세 조회 URL 목록 만들기"
-      ansible.builtin.set_fact:
-        _host_detail_urls: >-
-          {{
-            (_host_detail_urls | default([])) + [
-              (controller_host | regex_replace('/$','') )
-              ~ '/api/v2/hosts/' ~ (item | string) ~ '/'
-            ]
-          }}
-      loop: "{{ host_ids }}"
-
-    - name: "[4] 상세 조회(variables 읽기)"
-      ansible.builtin.uri:
-        url: "{{ item }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
-        return_content: true
-        status_code: 200
-        validate_certs: false
-      loop: "{{ _host_detail_urls }}"
-      register: host_details
-
-    - name: "[4] 최종 검증 리포트 (저장된 variables 스니펫)"
+    - name: "[4] 최종 검증 리포트(이름과 variables 스니펫)"
       ansible.builtin.debug:
         msg: >-
           {{
-            host_details.results
-            | map(attribute='json')
+            final_hosts.json.results
             | map('extract', {'name': 'name', 'variables': 'variables'})
             | list
           }}
