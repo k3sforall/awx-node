@@ -1,27 +1,25 @@
 ---
-- name: "E2E | K8s 라벨 → AWX 인벤토리 반영 (상세 로그 + 직접 PATCH + 사후 검증)"
+- name: "E2E | K8s 라벨 → AWX 인벤토리 반영 (kubeconfig 우선 + 상세 로그 + 직접 PATCH + 사후 검증)"
   hosts: localhost
   connection: local
   gather_facts: false
   any_errors_fatal: true
 
   vars:
-    # === Job Template의 Extra Vars에서 채우세요 ===
-    controller_host: "http://awx-service.awx.svc.cluster.local"  # 내부 DNS 권장
+    controller_host: "http://awx-service.awx.svc.cluster.local"
     controller_oauthtoken: ""
     organization_name: "Default"
     inventory_name: "k3s-nodes"
 
+    # 폴백용(크레덴셜이 없을 때만 사용)
     k8s_host: "https://kubernetes.default.svc"
-    k8s_token: ""                 # SA 토큰(유효/audience 일치)
+    k8s_token: ""
     k8s_validate_certs: false
 
-    awx_node_user: "ubuntu"       # ansible_user로 반영
+    awx_node_user: "ubuntu"
 
   tasks:
-    #####################################################################
-    # 0) AWX API 확인
-    #####################################################################
+    # 0) AWX ping
     - name: "[0] Preflight | GET /api/v2/ping"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/ping/"
@@ -38,9 +36,7 @@
           - "AWX version={{ awx_ping.json.version | default('unknown') }}"
           - "active_node={{ awx_ping.json.active_node | default('n/a') }}"
 
-    #####################################################################
-    # 1) 조직/인벤토리 보장 + ID 확보
-    #####################################################################
+    # 1) 조직/인벤토리 보장
     - name: "[1] 조직 조회 (name={{ organization_name }})"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/organizations/?name={{ organization_name | urlencode }}"
@@ -71,7 +67,7 @@
         body:
           name: "{{ inventory_name }}"
           organization: "{{ organization_id }}"
-        status_code: [201, 400]  # 생성됨/이미 존재
+        status_code: [201, 400]
         validate_certs: false
       register: inv_post
       failed_when: inv_post.status not in [201, 400]
@@ -100,24 +96,39 @@
           - "organization_id={{ organization_id }}"
           - "inventory_id={{ inventory_id }} ({{ inventory_name }})"
 
-    #####################################################################
-    # 2) K8s 노드 수집
-    #####################################################################
-    - name: "[2] K8s Nodes 수집(k8s_info)"
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Node
-        host: "{{ k8s_host }}"
-        api_key: "{{ k8s_token }}"           # 토큰만(‘Bearer ’ 금지)
-        validate_certs: "{{ k8s_validate_certs }}"
-      register: k8s_nodes
-
-    - name: "[2] nodes_flat 초기화"
+    # 2) K8s 인증 인자 합성 (kubeconfig 우선)
+    - name: "[2] kubeconfig 주입 여부 점검"
       ansible.builtin.set_fact:
-        nodes_flat: []
+        injected_kubeconfig: "{{ lookup('env','K8S_AUTH_KUBECONFIG') | default('', true) }}"
+    - name: "[2] k8s_info 인자 합성 (kubeconfig 우선, 없으면 host+token 폴백)"
+      ansible.builtin.set_fact:
+        k8s_info_args: >-
+          {{
+            (
+              {'api_version':'v1','kind':'Node'} |
+              combine(
+                (injected_kubeconfig | length > 0)
+                | ternary(
+                  {'kubeconfig': injected_kubeconfig},
+                  {'host': k8s_host, 'api_key': k8s_token, 'validate_certs': k8s_validate_certs}
+                )
+              )
+            )
+          }}
+
+    - name: "[2] k8s_info 인자 디버그"
+      ansible.builtin.debug:
+        var: k8s_info_args
+
+    # 2) K8s 노드 수집
+    - name: "[2] K8s Nodes 수집(k8s_info)"
+      kubernetes.core.k8s_info: "{{ k8s_info_args }}"
+      register: k8s_nodes
 
     - name: "[2] nodes_flat 구성(name, ip, labels)"
       ansible.builtin.set_fact:
+        nodes_flat: []
+    - ansible.builtin.set_fact:
         nodes_flat: >-
           {{ nodes_flat + [ {
               'name': item.metadata.name,
@@ -140,9 +151,7 @@
         that: "(nodes_flat | length) > 0"
         fail_msg: "K8s에서 노드를 하나도 찾지 못했습니다."
 
-    #####################################################################
-    # 3) 호스트 조회(존재 여부) → 없으면 생성
-    #####################################################################
+    # 3) 호스트 존재 확인 → 생성
     - name: "[3] 1/5 호스트 조회 (name+inventory)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?name={{ item.name | urlencode }}&inventory={{ inventory_id }}"
@@ -178,14 +187,14 @@
           name: "{{ item.name }}"
           inventory: "{{ inventory_id }}"
           enabled: true
-        status_code: [201, 400]   # 생성/이미 있음
+        status_code: [201, 400]
         validate_certs: false
       when: not item.exists
       loop: "{{ host_records }}"
       loop_control: { label: "{{ item.name }}" }
       register: host_create
 
-    - name: "[3] 3/5 생성 이후 ID 재조회(GET, 전체)"
+    - name: "[3] 3/5 생성 이후 ID 재조회(GET)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?name={{ item.name | urlencode }}&inventory={{ inventory_id }}"
         method: GET
@@ -214,9 +223,7 @@
       loop: "{{ host_records2 }}"
       loop_control: { label: "{{ item.name }}" }
 
-    #####################################################################
-    # 4) 현재 variables GET → 목표 YAML과 비교 → 필요 시 PATCH
-    #####################################################################
+    # 4) 현재 variables GET → 목표와 비교 → 필요 시 PATCH
     - name: "[4] 1/4 현재 variables 조회(GET /hosts/<id>/)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/{{ item.host_id }}/"
@@ -252,27 +259,16 @@
       ansible.builtin.set_fact:
         to_patch: >-
           {{
-            desired_map.keys()
-            | select('match', '.*') | list
-            | map('extract', desired_map)
-            | selectattr('desired_yaml', 'ne', attribute='current_yaml')
-            | list
-          }}
-
-    - name: "[4] 변경 대상 요약(이름/변경 전/후)"
-      ansible.builtin.debug:
-        msg: >-
-          {{
             desired_map
             | dict2items
             | selectattr('value.desired_yaml', 'ne', 'value.current_yaml')
-            | map(
-                'regex_replace',
-                '^(.*)$',
-                'HOST=' ~ (desired_map.keys() | list)[ (loop.index0 | default(0)) ] ~ ' :: DIFF'
-              )
+            | map(attribute='value')
+            | list
           }}
-      when: to_patch | length > 0
+
+    - name: "[4] 변경 대상 요약(개수={{ to_patch|length }})"
+      ansible.builtin.debug:
+        var: to_patch
 
     - name: "[4] 4/4 PATCH /hosts/<id>/ (variables 갱신)"
       ansible.builtin.uri:
@@ -288,14 +284,11 @@
         status_code: 200
         validate_certs: false
       loop: "{{ to_patch }}"
-      loop_control:
-        label: "{{ item.host_id }}"
+      loop_control: { label: "{{ item.host_id }}" }
       register: patch_results
       when: to_patch | length > 0
 
-    #####################################################################
-    # 5) 사후 검증: 실제 저장된 variables 확인
-    #####################################################################
+    # 5) 사후 검증
     - name: "[5] 사후 검증 | hosts/?inventory=<id>"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?inventory={{ inventory_id }}"
