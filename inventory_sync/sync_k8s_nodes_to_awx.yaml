@@ -6,25 +6,27 @@
   any_errors_fatal: true
 
   vars:
-    controller_host: "http://awx-service.awx.svc.cluster.local"
+    # === Job Template의 Extra Vars에서 채우세요 ===
+    controller_host: "http://awx-service.awx.svc.cluster.local"  # 내부 DNS 권장
     controller_oauthtoken: ""
     organization_name: "Default"
     inventory_name: "k3s-nodes"
 
     k8s_host: "https://kubernetes.default.svc"
-    k8s_token: ""
+    k8s_token: ""                 # SA 토큰(유효/audience 일치)
     k8s_validate_certs: false
 
-    awx_node_user: "ubuntu"
+    awx_node_user: "ubuntu"       # ansible_user로 반영
 
   tasks:
-    # 0) AWX ping
+    #####################################################################
+    # 0) AWX API 확인
+    #####################################################################
     - name: "[0] Preflight | GET /api/v2/ping"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/ping/"
         method: GET
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
         return_content: true
         status_code: 200
         validate_certs: false
@@ -36,13 +38,14 @@
           - "AWX version={{ awx_ping.json.version | default('unknown') }}"
           - "active_node={{ awx_ping.json.active_node | default('n/a') }}"
 
-    # 1) 조직/인벤토리 보장
+    #####################################################################
+    # 1) 조직/인벤토리 보장 + ID 확보
+    #####################################################################
     - name: "[1] 조직 조회 (name={{ organization_name }})"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/organizations/?name={{ organization_name | urlencode }}"
         method: GET
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
         return_content: true
         status_code: 200
         validate_certs: false
@@ -68,9 +71,7 @@
         body:
           name: "{{ inventory_name }}"
           organization: "{{ organization_id }}"
-        status_code:
-          - 201   # created
-          - 400   # already exists
+        status_code: [201, 400]  # 생성됨/이미 존재
         validate_certs: false
       register: inv_post
       failed_when: inv_post.status not in [201, 400]
@@ -79,8 +80,7 @@
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/inventories/?name={{ inventory_name | urlencode }}&organization={{ organization_id }}"
         method: GET
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
         return_content: true
         status_code: 200
         validate_certs: false
@@ -100,13 +100,15 @@
           - "organization_id={{ organization_id }}"
           - "inventory_id={{ inventory_id }} ({{ inventory_name }})"
 
+    #####################################################################
     # 2) K8s 노드 수집
+    #####################################################################
     - name: "[2] K8s Nodes 수집(k8s_info)"
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Node
         host: "{{ k8s_host }}"
-        api_key: "{{ k8s_token }}"            # 토큰만(‘Bearer ’ 금지)
+        api_key: "{{ k8s_token }}"           # 토큰만(‘Bearer ’ 금지)
         validate_certs: "{{ k8s_validate_certs }}"
       register: k8s_nodes
 
@@ -127,8 +129,7 @@
               'labels': (item.metadata.labels | default({}))
             } ] }}
       loop: "{{ k8s_nodes.resources | default([]) }}"
-      loop_control:
-        label: "{{ (item.metadata.name | default('unknown')) }}"
+      loop_control: { label: "{{ (item.metadata.name | default('unknown')) }}" }
 
     - name: "[2] 발견한 노드 목록 (name/ip/labels)"
       ansible.builtin.debug:
@@ -139,32 +140,173 @@
         that: "(nodes_flat | length) > 0"
         fail_msg: "K8s에서 노드를 하나도 찾지 못했습니다."
 
-    # 3) 각 노드 → 호스트 생성/갱신 (직접 API)
-    - name: "[3] 호스트 처리 루프: 조회→없으면 생성→비교→PATCH"
-      ansible.builtin.include_tasks: "tasks_host_upsert.yml"
+    #####################################################################
+    # 3) 호스트 조회(존재 여부) → 없으면 생성
+    #####################################################################
+    - name: "[3] 1/5 호스트 조회 (name+inventory)"
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?name={{ item.name | urlencode }}&inventory={{ inventory_id }}"
+        method: GET
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
+        return_content: true
+        status_code: 200
+        validate_certs: false
       loop: "{{ nodes_flat }}"
-      loop_control:
-        loop_var: nodeitem
-        label: "{{ nodeitem.name }} ({{ nodeitem.ip }})"
-      vars:
-        _controller_host: "{{ controller_host | regex_replace('/$','') }}"
-        _token: "{{ controller_oauthtoken }}"
-        _inventory_id: "{{ inventory_id }}"
-        _awx_user: "{{ awx_node_user }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: host_query1
 
-    # 4) 사후 검증 리포트
-    - name: "[4] 사후 검증 | hosts/?name=*&inventory=id"
+    - name: "[3] 조회 결과 병합(존재 여부/ID)"
+      ansible.builtin.set_fact:
+        host_records: "{{ (host_records | default([])) + [ {
+                          'name': item.0.name,
+                          'ip': item.0.ip,
+                          'labels': item.0.labels,
+                          'exists': ((item.1.json.results | length) > 0),
+                          'host_id': (item.1.json.results[0].id if (item.1.json.results | length) > 0 else None)
+                        } ] }}"
+      loop: "{{ nodes_flat | zip(host_query1.results) | list }}"
+
+    - name: "[3] 2/5 없는 호스트 생성(POST)"
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          inventory: "{{ inventory_id }}"
+          enabled: true
+        status_code: [201, 400]   # 생성/이미 있음
+        validate_certs: false
+      when: not item.exists
+      loop: "{{ host_records }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: host_create
+
+    - name: "[3] 3/5 생성 이후 ID 재조회(GET, 전체)"
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?name={{ item.name | urlencode }}&inventory={{ inventory_id }}"
+        method: GET
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      loop: "{{ nodes_flat }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: host_query2
+
+    - name: "[3] 4/5 host_id 확정 리스트 재구성"
+      ansible.builtin.set_fact:
+        host_records2: "{{ (host_records2 | default([])) + [ {
+                           'name': item.0.name,
+                           'ip': item.0.ip,
+                           'labels': item.0.labels,
+                           'host_id': (item.1.json.results[0].id if (item.1.json.results | length) > 0 else None)
+                         } ] }}"
+      loop: "{{ nodes_flat | zip(host_query2.results) | list }}"
+
+    - name: "[3] 5/5 host_id 미확보 검증"
+      ansible.builtin.assert:
+        that: "item.host_id is not none"
+        fail_msg: "host_id 확보 실패: {{ item.name }}"
+      loop: "{{ host_records2 }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    #####################################################################
+    # 4) 현재 variables GET → 목표 YAML과 비교 → 필요 시 PATCH
+    #####################################################################
+    - name: "[4] 1/4 현재 variables 조회(GET /hosts/<id>/)"
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/{{ item.host_id }}/"
+        method: GET
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      loop: "{{ host_records2 }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: host_detail
+
+    - name: "[4] 2/4 비교·목표 YAML 생성"
+      ansible.builtin.set_fact:
+        desired_map: >-
+          {{
+            (desired_map | default({})) | combine({
+              item.0.name: {
+                'desired_yaml': ({
+                    'ansible_host': item.0.ip,
+                    'ansible_user': awx_node_user,
+                    'k8s_name':     item.0.name,
+                    'k8s_labels':   item.0.labels|default({})
+                 } | to_nice_yaml | trim),
+                'current_yaml': ((item.1.json.variables | default('')) | trim),
+                'host_id': item.0.host_id
+              }
+            })
+          }}
+      loop: "{{ host_records2 | zip(host_detail.results) | list }}"
+
+    - name: "[4] 3/4 변경 필요한 대상 목록 산출"
+      ansible.builtin.set_fact:
+        to_patch: >-
+          {{
+            desired_map.keys()
+            | select('match', '.*') | list
+            | map('extract', desired_map)
+            | selectattr('desired_yaml', 'ne', attribute='current_yaml')
+            | list
+          }}
+
+    - name: "[4] 변경 대상 요약(이름/변경 전/후)"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            desired_map
+            | dict2items
+            | selectattr('value.desired_yaml', 'ne', 'value.current_yaml')
+            | map(
+                'regex_replace',
+                '^(.*)$',
+                'HOST=' ~ (desired_map.keys() | list)[ (loop.index0 | default(0)) ] ~ ' :: DIFF'
+              )
+          }}
+      when: to_patch | length > 0
+
+    - name: "[4] 4/4 PATCH /hosts/<id>/ (variables 갱신)"
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/{{ item.host_id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          variables: "{{ item.desired_yaml }}"
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      loop: "{{ to_patch }}"
+      loop_control:
+        label: "{{ item.host_id }}"
+      register: patch_results
+      when: to_patch | length > 0
+
+    #####################################################################
+    # 5) 사후 검증: 실제 저장된 variables 확인
+    #####################################################################
+    - name: "[5] 사후 검증 | hosts/?inventory=<id>"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?inventory={{ inventory_id }}"
         method: GET
-        headers:
-          Authorization: "Bearer {{ controller_oauthtoken }}"
+        headers: { Authorization: "Bearer {{ controller_oauthtoken }}" }
         return_content: true
         status_code: 200
         validate_certs: false
       register: final_hosts
 
-    - name: "[4] 최종 검증 리포트(이름과 variables 스니펫)"
+    - name: "[5] 최종 리포트(호스트별 variables 스니펫)"
       ansible.builtin.debug:
         msg: >-
           {{
