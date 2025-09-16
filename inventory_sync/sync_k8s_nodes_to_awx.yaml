@@ -11,7 +11,7 @@
     inventory_name: "k3s-nodes"
 
   tasks:
-    - name: Preflight | AWX /api/v2/ping
+    - name: "Preflight | AWX /api/v2/ping"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/ping/"
         method: GET
@@ -22,11 +22,11 @@
         validate_certs: false
       register: awx_ping
 
-    - name: Debug | ping result (optional)
+    - name: "Debug | ping result (optional)"
       ansible.builtin.debug:
         var: awx_ping.json
 
-    - name: Lookup | Organization by name (SAFE: use params to avoid spaces)
+    - name: "Lookup | Organization by name (SAFE: use params to avoid spaces)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/organizations/"
         method: GET
@@ -35,21 +35,20 @@
         return_content: true
         status_code: 200
         validate_certs: false
-        # ✅ 여기서 params 사용: 공백/인코딩 문제 방지
         params:
           name: "{{ organization_name }}"
       register: org_q
 
-    - name: Fail if organization not found
+    - name: "Fail if organization not found"
       ansible.builtin.fail:
         msg: "Organization '{{ organization_name }}' not found (results=0)."
       when: (org_q.json.results | length) == 0
 
-    - name: Set fact | organization_id
+    - name: "Set fact | organization_id"
       ansible.builtin.set_fact:
         organization_id: "{{ org_q.json.results[0].id | int }}"
 
-    - name: Ensure target inventory exists (by org_id)
+    - name: "Ensure target inventory exists (by org_id)"
       awx.awx.inventory:
         name: "{{ inventory_name }}"
         organization: "{{ organization_id }}"     # 숫자 ID 사용
