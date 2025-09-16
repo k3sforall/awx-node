@@ -4,12 +4,11 @@
   gather_facts: false
 
   vars:
-    # AWX Job Template 실행 시 Extra Vars로 넣을 값
-    k8s_host: "https://<k3s-control-plane-ip>:6443"   # 예: https://192.168.0.21:6443
-    k8s_token: ""                                     # 서비스어카운트 토큰 문자열
-    k8s_validate_certs: false                         # 자체서명/HTTP 환경이면 false
-    controller_host: "http://awx.dokjongban.com"      # AWX 주소(HTTP면 validate_certs: false)
-    controller_oauthtoken: ""                         # Users → 본인 → Tokens → Add 로 발급한 토큰
+    k8s_host: "https://kubernetes.default.svc"
+    k8s_token: ""
+    k8s_validate_certs: false
+    controller_host: "http://awx.dokjongban.com"
+    controller_oauthtoken: ""
     organization: "Default"
     inventory_name: "k3s-nodes"
 
@@ -19,7 +18,7 @@
         api_version: v1
         kind: Node
         host: "{{ k8s_host }}"
-        api_key: "{{ k8s_token }}"
+        api_key: "{{ k8s_token }}"          # ❗ 토큰만 (Bearer 접두어 금지)
         validate_certs: "{{ k8s_validate_certs }}"
       register: k8s_nodes
 
