@@ -1,13 +1,13 @@
 ---
-- name: Ensure AWX inventory via API (with preflight checks)
+- name: Ensure AWX inventory via API (with preflight checks, fixed URL)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # --- 여기를 Job Template Extra Vars에서 채우세요 ---
-    controller_host: "http://awx-service.awx.svc.cluster.local"  # 내부 서비스 DNS 권장
-    controller_oauthtoken: ""          # Users -> 본인 -> Tokens -> Add 로 발급한 토큰
-    organization_name: "Default"       # 실제 조직명 (다르면 바꾸세요)
+    # === Job Template의 Extra Vars에서 채우십시오 ===
+    controller_host: "http://awx-service.awx.svc.cluster.local"   # 내부 서비스 DNS 권장
+    controller_oauthtoken: ""                                      # Users → Tokens → Add 로 발급
+    organization_name: "Default"                                   # 실제 조직명
     inventory_name: "k3s-nodes"
 
   tasks:
@@ -26,17 +26,18 @@
       ansible.builtin.debug:
         var: awx_ping.json
 
-    - name: Lookup | Organization by name
+    - name: Lookup | Organization by name (SAFE: use params to avoid spaces)
       ansible.builtin.uri:
-        url: >-
-          {{ controller_host | regex_replace('/$','') }}/api/v2/organizations/
-          ?name={{ organization_name | urlencode }}
+        url: "{{ controller_host | regex_replace('/$','') }}/api/v2/organizations/"
         method: GET
         headers:
           Authorization: "Bearer {{ controller_oauthtoken }}"
         return_content: true
         status_code: 200
         validate_certs: false
+        # ✅ 여기서 params 사용: 공백/인코딩 문제 방지
+        params:
+          name: "{{ organization_name }}"
       register: org_q
 
     - name: Fail if organization not found
@@ -51,9 +52,9 @@
     - name: Ensure target inventory exists (by org_id)
       awx.awx.inventory:
         name: "{{ inventory_name }}"
-        organization: "{{ organization_id }}"     # <-- 숫자 ID 사용
+        organization: "{{ organization_id }}"     # 숫자 ID 사용
         state: present
-        # 두 계열 파라미터 모두 전달(버전 호환)
+        # 호환성 위해 두 계열 모두 명시
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         tower_host: "{{ controller_host }}"
