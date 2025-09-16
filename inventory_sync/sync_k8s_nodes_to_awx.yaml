@@ -4,9 +4,12 @@
   gather_facts: false
 
   vars:
-    # Job Template 실행 시 Extra Vars로 넘깁니다.
-    controller_host: "{{ controller_host | default(omit) }}"
-    controller_oauthtoken: "{{ controller_oauthtoken | default(omit) }}"
+    # AWX Job Template 실행 시 Extra Vars로 넣을 값
+    k8s_host: "https://<k3s-control-plane-ip>:6443"   # 예: https://192.168.0.21:6443
+    k8s_token: ""                                     # 서비스어카운트 토큰 문자열
+    k8s_validate_certs: false                         # 자체서명/HTTP 환경이면 false
+    controller_host: "http://awx.dokjongban.com"      # AWX 주소(HTTP면 validate_certs: false)
+    controller_oauthtoken: ""                         # Users → 본인 → Tokens → Add 로 발급한 토큰
     organization: "Default"
     inventory_name: "k3s-nodes"
 
@@ -15,9 +18,9 @@
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Node
-        # K8S_AUTH_HOST / K8S_AUTH_API_KEY 를 AWX가 자격증명으로 주입
-        # 자체서명 환경이면 다음 줄을 켜세요:
-        # validate_certs: false
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_token }}"
+        validate_certs: "{{ k8s_validate_certs }}"
       register: k8s_nodes
 
     - name: Ensure target inventory exists
@@ -27,11 +30,16 @@
         state: present
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
-        validate_certs: false   # HTTP 사용 시/자체서명 시
+        validate_certs: false
 
     - name: Build simplified host objects
       vars:
-        jq: "[].{name: metadata.name, labels: metadata.labels, ip: (status.addresses | items | selectattr('type','equalto','InternalIP') | map(attribute='address') | first)}"
+        jq: >-
+          [].{name: metadata.name,
+              labels: metadata.labels,
+              ip: (status.addresses | items
+                   | selectattr('type','equalto','InternalIP')
+                   | map(attribute='address') | first)}
       set_fact:
         nodes_flat: "{{ k8s_nodes.resources | default([]) | json_query(jq) }}"
 
