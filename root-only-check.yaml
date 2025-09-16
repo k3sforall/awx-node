@@ -1,0 +1,44 @@
+---
+- name: Verify become(sudo) by writing into root-only locations
+  hosts: all
+  become: true   # 중요: 항상 root로 실행되도록 보장
+  vars:
+    stamp_dir: /root/awx-root-check
+    stamp_file: /root/awx-root-check/verified.txt
+    run_log: /root/awx-root-check/run.log
+
+  tasks:
+    - name: Show effective user (should be root)
+      ansible.builtin.command: whoami
+      register: whoami_out
+    - name: Print effective user
+      ansible.builtin.debug:
+        msg: "effective user = {{ whoami_out.stdout }} (expect: root)"
+
+    - name: Ensure stamp directory exists (root-only path)
+      ansible.builtin.file:
+        path: "{{ stamp_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Ensure verified stamp file exists (idempotent)
+      ansible.builtin.copy:
+        dest: "{{ stamp_file }}"
+        content: |
+          AWX root check: OK
+          This file is managed by Ansible.
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Append run log with timestamp (idempotent append)
+      ansible.builtin.lineinfile:
+        path: "{{ run_log }}"
+        line: "run at {{ ansible_date_time.iso8601 }} by {{ whoami_out.stdout }}"
+        create: true
+        owner: root
+        group: root
+        mode: "0600"
+
