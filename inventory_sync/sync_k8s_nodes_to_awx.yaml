@@ -7,13 +7,13 @@
 
   vars:
     controller_host: "http://awx-service.awx.svc.cluster.local"
-    controller_oauthtoken: ""
+    controller_oauthtoken: ""          # AWX OAuth 토큰
     organization_name: "Default"
     inventory_name: "k3s-nodes"
 
-    # 폴백용(크레덴셜이 없을 때만 사용)
-    k8s_host: "https://kubernetes.default.svc"
-    k8s_token: ""
+    # kubeconfig 미주입 시 폴백
+    k8s_host: "https://192.168.0.21:6443"   # 또는 https://kubernetes.default.svc
+    k8s_token: ""                           # SA 토큰(폴백용)
     k8s_validate_certs: false
 
     awx_node_user: "ubuntu"
@@ -100,6 +100,7 @@
     - name: "[2] kubeconfig 주입 여부 점검"
       ansible.builtin.set_fact:
         injected_kubeconfig: "{{ lookup('env','K8S_AUTH_KUBECONFIG') | default('', true) }}"
+
     - name: "[2] k8s_info 인자 합성 (kubeconfig 우선, 없으면 host+token 폴백)"
       ansible.builtin.set_fact:
         k8s_info_args: >-
@@ -125,10 +126,12 @@
       kubernetes.core.k8s_info: "{{ k8s_info_args }}"
       register: k8s_nodes
 
-    - name: "[2] nodes_flat 구성(name, ip, labels)"
+    - name: "[2] nodes_flat 초기화"
       ansible.builtin.set_fact:
         nodes_flat: []
-    - ansible.builtin.set_fact:
+
+    - name: "[2] nodes_flat 구성(name, ip, labels)"
+      ansible.builtin.set_fact:
         nodes_flat: >-
           {{ nodes_flat + [ {
               'name': item.metadata.name,
@@ -151,7 +154,7 @@
         that: "(nodes_flat | length) > 0"
         fail_msg: "K8s에서 노드를 하나도 찾지 못했습니다."
 
-    # 3) 호스트 존재 확인 → 생성
+    # 3) 호스트 조회/생성
     - name: "[3] 1/5 호스트 조회 (name+inventory)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?name={{ item.name | urlencode }}&inventory={{ inventory_id }}"
@@ -223,7 +226,7 @@
       loop: "{{ host_records2 }}"
       loop_control: { label: "{{ item.name }}" }
 
-    # 4) 현재 variables GET → 목표와 비교 → 필요 시 PATCH
+    # 4) variables 비교 → PATCH
     - name: "[4] 1/4 현재 variables 조회(GET /hosts/<id>/)"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/{{ item.host_id }}/"
@@ -288,7 +291,7 @@
       register: patch_results
       when: to_patch | length > 0
 
-    # 5) 사후 검증
+    # 5) 사후 검증 및 최종 리포트 (수정 포인트)
     - name: "[5] 사후 검증 | hosts/?inventory=<id>"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/?inventory={{ inventory_id }}"
@@ -299,11 +302,20 @@
         validate_certs: false
       register: final_hosts
 
+    - name: "[5] k8s_labels 포함 여부 점검"
+      ansible.builtin.assert:
+        that:
+          - "'k8s_labels:' in (item.variables | default(''))"
+        fail_msg: "호스트 {{ item.name }} variables에 k8s_labels 가 반영되지 않았습니다."
+      loop: "{{ final_hosts.json.results }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: "[5] 최종 리포트 리스트 생성(name, variables)"
+      ansible.builtin.set_fact:
+        final_report: "{{ (final_report | default([])) + [ {'name': item.name, 'variables': item.variables|default('')} ] }}"
+      loop: "{{ final_hosts.json.results }}"
+      loop_control: { label: "{{ item.name }}" }
+
     - name: "[5] 최종 리포트(호스트별 variables 스니펫)"
       ansible.builtin.debug:
-        msg: >-
-          {{
-            final_hosts.json.results
-            | map('extract', {'name': 'name', 'variables': 'variables'})
-            | list
-          }}
+        var: final_report
