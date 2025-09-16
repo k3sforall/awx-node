@@ -1,16 +1,28 @@
 ---
-- name: Ensure AWX inventory via API (preflight + org lookup, no params)
+- name: E2E | Ensure AWX inventory and sync K8s nodes (with clear summary)
   hosts: localhost
   gather_facts: false
 
   vars:
     # === Job Template의 Extra Vars에서 채우십시오 ===
-    controller_host: "http://awx-service.awx.svc.cluster.local"   # 내부 서비스 DNS 권장
-    controller_oauthtoken: ""                                      # Users → Tokens → Add 로 발급
-    organization_name: "Default"                                   # 실제 조직명
+    # AWX(컨트롤러) 접근
+    controller_host: "http://awx-service.awx.svc.cluster.local"
+    controller_oauthtoken: ""
+    organization_name: "Default"
     inventory_name: "k3s-nodes"
 
+    # K8s API 접근
+    k8s_host: "https://kubernetes.default.svc"   # 내부에서 안정적
+    k8s_token: ""                                 # SA 토큰(올바른 audience/유효기간)
+    k8s_validate_certs: false
+
+    # 동기화 시 호스트에 주입할 기본 접속계정(필요 시 변경)
+    awx_node_user: "ubuntu"
+
   tasks:
+    #####################################################################
+    # 0) 프리플라이트: 컨트롤러 API 확인
+    #####################################################################
     - name: "Preflight | AWX /api/v2/ping"
       ansible.builtin.uri:
         url: "{{ controller_host | regex_replace('/$','') }}/api/v2/ping/"
@@ -22,14 +34,17 @@
         validate_certs: false
       register: awx_ping
 
+    - name: "Debug | ping result (optional)"
+      ansible.builtin.debug:
+        var: awx_ping.json
+
+    #####################################################################
+    # 1) 조직 조회 → ID 확보
+    #####################################################################
     - name: "Build safe org lookup URL (no spaces, urlencode)"
       ansible.builtin.set_fact:
         org_lookup_url: >-
           {{ controller_host | regex_replace('/$','') }}/api/v2/organizations/?name={{ organization_name | urlencode }}
-
-    - name: "Debug | org_lookup_url"
-      ansible.builtin.debug:
-        var: org_lookup_url
 
     - name: "Lookup | Organization by name"
       ansible.builtin.uri:
@@ -51,15 +66,91 @@
       ansible.builtin.set_fact:
         organization_id: "{{ org_q.json.results[0].id | int }}"
 
+    #####################################################################
+    # 2) 인벤토리 존재 보장
+    #####################################################################
     - name: "Ensure target inventory exists (by org_id)"
       awx.awx.inventory:
         name: "{{ inventory_name }}"
-        organization: "{{ organization_id }}"     # 숫자 ID 사용
+        organization: "{{ organization_id }}"
         state: present
-        # 호환성 위해 두 계열 모두 명시 (awx.awx 버전 차 대응)
+        # 호환성 위해 controller_*, tower_* 모두 명시
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         tower_host: "{{ controller_host }}"
         tower_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: false
         tower_verify_ssl: false
+      register: inv_result
+
+    - name: "Debug | inventory ensure (optional)"
+      ansible.builtin.debug:
+        var: inv_result
+
+    #####################################################################
+    # 3) K8s 노드 수집
+    #####################################################################
+    - name: "Collect Kubernetes Nodes (no kubeconfig)"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_token }}"            # 'Bearer ' 없이 '토큰만' 전달
+        validate_certs: "{{ k8s_validate_certs }}"
+      register: k8s_nodes
+
+    - name: "Build nodes_flat (name, labels, ip)"
+      vars:
+        jq: >-
+          [].{name: metadata.name,
+              labels: metadata.labels,
+              ip: (status.addresses | items
+                   | selectattr('type','equalto','InternalIP')
+                   | map(attribute='address') | first)}
+      ansible.builtin.set_fact:
+        nodes_flat: "{{ k8s_nodes.resources | default([]) | json_query(jq) }}"
+
+    - name: "Show discovered nodes (for visibility)"
+      ansible.builtin.debug:
+        msg: "{{ nodes_flat | to_nice_yaml }}"
+
+    #####################################################################
+    # 4) 호스트 업서트(+ 변수 주입) - 변경 요약까지 출력
+    #####################################################################
+    - name: "Upsert host into AWX (loop)"
+      awx.awx.host:
+        name: "{{ item.name }}"
+        inventory: "{{ inventory_name }}"
+        state: present
+        enabled: true
+        variables:
+          ansible_host: "{{ item.ip }}"
+          ansible_user: "{{ awx_node_user }}"
+          k8s_name: "{{ item.name }}"
+          k8s_labels: "{{ item.labels | default({}) }}"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        tower_host: "{{ controller_host }}"
+        tower_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: false
+        tower_verify_ssl: false
+      loop: "{{ nodes_flat }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.ip }})"
+      register: host_upserts
+
+    - name: "Summarize changes"
+      ansible.builtin.set_fact:
+        changed_hosts: "{{ host_upserts.results
+                           | selectattr('changed','equalto', true)
+                           | map(attribute='item.name') | list }}"
+        total_hosts: "{{ nodes_flat | length }}"
+        changed_count: "{{ (host_upserts.results
+                           | selectattr('changed','equalto', true) | list) | length }}"
+
+    - name: "Summary | {{ changed_count }} changed of {{ total_hosts }} hosts"
+      ansible.builtin.debug:
+        msg:
+          - "total_hosts={{ total_hosts }}"
+          - "changed_count={{ changed_count }}"
+          - "changed_hosts={{ changed_hosts }}"
