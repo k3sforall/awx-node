@@ -32,3 +32,293 @@
           method: GET
           headers:
             Authorization: "Bearer {{ controller_oauthtoken }}"
+          return_content: true
+          status_code: 200
+          validate_certs: false
+        register: awx_ping
+
+      - name: "[0] Ping 결과 요약"
+        debug:
+          msg:
+            - "AWX version={{ awx_ping.json.version | default('unknown') }}"
+            - "active_node={{ awx_ping.json.active_node | default('n/a') }}"
+
+      #####################################################################
+      # 1) 조직/인벤토리 보장 + ID 확보
+      #####################################################################
+      - name: "[1] 조직 조회 URL 생성"
+        set_fact:
+          org_lookup_url: >-
+            {{ controller_host | regex_replace('/$','') }}/api/v2/organizations/?name={{ organization_name | urlencode }}
+
+      - name: "[1] 조직 조회"
+        uri:
+          url: "{{ org_lookup_url }}"
+          method: GET
+          headers:
+            Authorization: "Bearer {{ controller_oauthtoken }}"
+          return_content: true
+          status_code: 200
+          validate_certs: false
+        register: org_q
+
+      - name: "[1] 조직 존재 확인"
+        assert:
+          that: "(org_q.json.results | length) > 0"
+          fail_msg: "조직 '{{ organization_name }}' 을(를) 찾지 못했습니다."
+
+      - name: "[1] organization_id 설정"
+        set_fact:
+          organization_id: "{{ org_q.json.results[0].id | int }}"
+
+      - name: "[1] 인벤토리 보장"
+        uri:
+          url: "{{ controller_host | regex_replace('/$','') }}/api/v2/inventories/"
+          method: POST
+          headers:
+            Authorization: "Bearer {{ controller_oauthtoken }}"
+            Content-Type: "application/json"
+          body_format: json
+          body:
+            name: "{{ inventory_name }}"
+            organization: "{{ organization_id }}"
+          status_code:
+            - 201   # created
+            - 400   # already exists(중복) → 아래서 재조회
+          validate_certs: false
+        register: inv_post
+        failed_when: inv_post.status not in [201, 400]
+
+      - name: "[1] 인벤토리 ID 확보 (재조회)"
+        uri:
+          url: >-
+            {{ controller_host | regex_replace('/$','') }}/api/v2/inventories/
+            ?name={{ inventory_name | urlencode }}
+            &organization={{ organization_id }}
+          method: GET
+          headers:
+            Authorization: "Bearer {{ controller_oauthtoken }}"
+          return_content: true
+          status_code: 200
+          validate_certs: false
+        register: inv_get
+
+      - name: "[1] 인벤토리 존재 확인"
+        assert:
+          that: "(inv_get.json.results | length) > 0"
+          fail_msg: "인벤토리 '{{ inventory_name }}' 을(를) 찾지 못했습니다."
+
+      - name: "[1] inventory_id 설정"
+        set_fact:
+          inventory_id: "{{ inv_get.json.results[0].id | int }}"
+
+      - name: "[1] 요약"
+        debug:
+          msg:
+            - "organization_id={{ organization_id }}"
+            - "inventory_id={{ inventory_id }} ({{ inventory_name }})"
+
+      #####################################################################
+      # 2) K8s 노드 수집
+      #####################################################################
+      - name: "[2] K8s Nodes 수집(k8s_info)"
+        kubernetes.core.k8s_info:
+          api_version: v1
+          kind: Node
+          host: "{{ k8s_host }}"
+          api_key: "{{ k8s_token }}"            # 토큰만(‘Bearer ’ 금지)
+          validate_certs: "{{ k8s_validate_certs }}"
+        register: k8s_nodes
+
+      - name: "[2] nodes_flat 초기화"
+        set_fact:
+          nodes_flat: []
+
+      - name: "[2] nodes_flat 구성(name, ip, labels)"
+        set_fact:
+          nodes_flat: >-
+            {{ nodes_flat + [ {
+                'name': item.metadata.name,
+                'ip': (
+                  (item.status.addresses | default([]))
+                  | selectattr('type','equalto','InternalIP')
+                  | map(attribute='address') | list | first | default('')
+                ),
+                'labels': (item.metadata.labels | default({}))
+              } ] }}
+        loop: "{{ k8s_nodes.resources | default([]) }}"
+        loop_control:
+          label: "{{ (item.metadata.name | default('unknown')) }}"
+
+      - name: "[2] 발견한 노드 목록"
+        debug:
+          var: nodes_flat
+
+      - name: "[2] 노드 수집 검증"
+        assert:
+          that: "(nodes_flat | length) > 0"
+          fail_msg: "K8s에서 노드를 하나도 찾지 못했습니다."
+
+      #####################################################################
+      # 3) 각 노드 → AWX 호스트 upsert(직접 API), 변경 여부 로그
+      #####################################################################
+      - name: "[3] 변경 통계 초기화"
+        set_fact:
+          changed_hosts: []
+          examined_hosts: []
+
+      - name: "[3] 호스트 upsert(존재 확인→생성/갱신) 루프"
+        vars:
+          _name: "{{ item.name }}"
+          _ip: "{{ item.ip }}"
+          _labels: "{{ item.labels | default({}) }}"
+          _desired_vars: >-
+            {{
+              {
+                'ansible_host': _ip,
+                'ansible_user': awx_node_user,
+                'k8s_name': _name,
+                'k8s_labels': _labels
+              }
+            }}
+          _desired_vars_yaml: "{{ _desired_vars | to_nice_yaml }}"
+        block:
+          # 3-1) Host 조회 (이름+인벤토리로 필터)
+          - name: "[3] ({{ _name }}) 호스트 조회"
+            uri:
+              url: >-
+                {{ controller_host | regex_replace('/$','') }}/api/v2/hosts/
+                ?name={{ _name | urlencode }}
+                &inventory={{ inventory_id }}
+              method: GET
+              headers:
+                Authorization: "Bearer {{ controller_oauthtoken }}"
+              return_content: true
+              status_code: 200
+              validate_certs: false
+            register: host_q
+
+          # 3-2) 없으면 생성(variables는 일단 빈 값으로 생성해도 되고, 곧 PATCH)
+          - name: "[3] ({{ _name }}) 호스트 생성(없을 때만)"
+            uri:
+              url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/"
+              method: POST
+              headers:
+                Authorization: "Bearer {{ controller_oauthtoken }}"
+                Content-Type: "application/json"
+              body_format: json
+              body:
+                name: "{{ _name }}"
+                inventory: "{{ inventory_id }}"
+                enabled: true
+                # variables를 바로 넣어도 되지만, 아래 PATCH 로직을 통일
+              status_code:
+                - 201
+                - 400   # 이미 존재
+              validate_certs: false
+            register: host_create
+            when: (host_q.json.results | length) == 0
+
+          # 3-3) host_id 확보(재조회 또는 기존 결과 사용)
+          - name: "[3] ({{ _name }}) host_id 확보"
+            set_fact:
+              _host_id: >-
+                {{
+                  (host_q.json.results[0].id if (host_q.json.results | length) > 0
+                  else (
+                    # host_create가 201이면 응답 안에 url/id가 포함되어 있지만
+                    # 안전하게 재조회
+                    query_result.json.results[0].id
+                  ))
+                }}
+            vars:
+              query_result: >-
+                {{
+                  (lookup('ansible.builtin.url',
+                          controller_host | regex_replace('/$','') ~ '/api/v2/hosts/?name=' ~ (_name | urlencode) ~ '&inventory=' ~ inventory_id,
+                          headers={'Authorization': 'Bearer ' ~ controller_oauthtoken},
+                          validate_certs=False,
+                          split_lines=False) | from_yaml | default({}))
+                }}
+            when: (host_q.json.results | length) == 0
+
+          - name: "[3] ({{ _name }}) host_id 확보(이미 있었던 경우)"
+            set_fact:
+              _host_id: "{{ host_q.json.results[0].id | int }}"
+            when: (host_q.json.results | length) > 0
+
+          # 3-4) 현재 variables 가져오기
+          - name: "[3] ({{ _name }}) 현재 variables 조회"
+            uri:
+              url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/{{ _host_id }}/"
+              method: GET
+              headers:
+                Authorization: "Bearer {{ controller_oauthtoken }}"
+              return_content: true
+              status_code: 200
+              validate_certs: false
+            register: host_detail
+
+          - name: "[3] ({{ _name }}) 현재/목표 variables 비교"
+            set_fact:
+              _current_yaml: "{{ (host_detail.json.variables | default('') ) | trim }}"
+              _need_update: "{{ _current_yaml != (_desired_vars_yaml | trim) }}"
+              examined_hosts: "{{ examined_hosts + [ _name ] }}"
+
+          - name: "[3] ({{ _name }}) 변경 없음 → 스킵"
+            debug:
+              msg:
+                - "UNCHANGED: {{ _name }} (ip={{ _ip }})"
+                - "현재 vars == 목표 vars (패치 불필요)"
+            when: not _need_update
+
+          # 3-5) 필요 시 PATCH로 variables 갱신
+          - name: "[3] ({{ _name }}) PATCH /hosts/{{ _host_id }}/variables 갱신"
+            uri:
+              url: "{{ controller_host | regex_replace('/$','') }}/api/v2/hosts/{{ _host_id }}/"
+              method: PATCH
+              headers:
+                Authorization: "Bearer {{ controller_oauthtoken }}"
+                Content-Type: "application/json"
+              body_format: json
+              body:
+                variables: "{{ _desired_vars_yaml }}"
+              status_code: 200
+              validate_certs: false
+            register: host_patch
+            when: _need_update
+
+          - name: "[3] ({{ _name }}) 변경 반영됨"
+            debug:
+              msg:
+                - "CHANGED: {{ _name }} (ip={{ _ip }})"
+                - "-> variables 갱신 완료"
+            when: _need_update
+
+          - name: "[3] ({{ _name }}) changed_hosts에 추가"
+            set_fact:
+              changed_hosts: "{{ changed_hosts + [ _name ] }}"
+            when: _need_update
+
+        loop: "{{ nodes_flat }}"
+        loop_control:
+          label: "{{ item.name }} ({{ item.ip }})"
+
+      - name: "[3] 요약"
+        debug:
+          msg:
+            - "검사한 호스트: {{ examined_hosts | length }}개 -> {{ examined_hosts }}"
+            - "변경된 호스트: {{ changed_hosts | length }}개 -> {{ changed_hosts }}"
+
+      - name: "[3] 최소 한 번은 검사되었는지 확인"
+        assert:
+          that: "(examined_hosts | length) > 0"
+          fail_msg: "호스트를 한 개도 검사하지 못했습니다."
+
+    rescue:
+      - name: "[RESCUE] 예외 발생 - 마지막 결과 덤프"
+        debug:
+          var: hostvars[inventory_hostname]
+      - name: "[RESCUE] 실패 처리"
+        fail:
+          msg: "플레이 중 예외가 발생했습니다. 위 로그를 확인하세요."
